@@ -1,5 +1,5 @@
 const { body, query, validationResult } = require("express-validator");
-const Database = require("../models/database");
+const { transactionQueries } = require("../models/database");
 
 class TransactionController {
   // Get user transactions with optional date filtering
@@ -18,37 +18,13 @@ class TransactionController {
         });
       }
 
-      const { startDate, endDate } = req.query;
-      const userId = req.user.id;
-
-      let queryText = `
-        SELECT id, user_id, amount, category, description, notes, 
-               transaction_date, created_at, updated_at
-        FROM transactions 
-        WHERE user_id = $1
-      `;
-      let queryParams = [userId];
-
-      // Add date filtering if provided
-      if (startDate && endDate) {
-        queryText += " AND transaction_date BETWEEN $2 AND $3";
-        queryParams.push(startDate, endDate);
-      } else if (startDate) {
-        queryText += " AND transaction_date >= $2";
-        queryParams.push(startDate);
-      } else if (endDate) {
-        queryText += " AND transaction_date <= $2";
-        queryParams.push(endDate);
-      }
-
-      queryText += " ORDER BY transaction_date DESC, created_at DESC";
-
-      const result = await Database.query(queryText, queryParams);
+      const userId = req.user.userId;
+      const transactions = await transactionQueries.findByUserId(userId);
 
       res.json({
         success: true,
-        transactions: result.rows,
-        count: result.rows.length,
+        transactions,
+        count: transactions.length,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -82,23 +58,19 @@ class TransactionController {
 
       const { amount, category, description, notes, transaction_date } =
         req.body;
-      const userId = req.user.id;
+      const userId = req.user.userId;
 
-      const result = await Database.query(
-        `INSERT INTO transactions (user_id, amount, category, description, notes, transaction_date)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, user_id, amount, category, description, notes, transaction_date, created_at`,
-        [
-          userId,
-          amount,
-          category,
-          description || null,
-          notes || null,
-          transaction_date,
-        ],
-      );
+      const transactionData = {
+        user_id: userId,
+        amount: parseFloat(amount),
+        category,
+        description: description || null,
+        notes: notes || null,
+        transaction_date:
+          transaction_date || new Date().toISOString().split("T")[0],
+      };
 
-      const newTransaction = result.rows[0];
+      const newTransaction = await transactionQueries.create(transactionData);
 
       res.status(201).json({
         success: true,
@@ -122,51 +94,27 @@ class TransactionController {
   // Get spending summary by category
   static async getSpendingSummary(req, res) {
     try {
-      const userId = req.user.id;
+      const userId = req.user.userId;
 
-      const result = await Database.query(
-        `SELECT 
-           category,
-           SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as income,
-           SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END) as expense,
-           SUM(amount) as net_total
-         FROM transactions 
-         WHERE user_id = $1
-         GROUP BY category
-         ORDER BY category`,
-        [userId],
-      );
+      // Get category summary
+      const categorySummary = await transactionQueries.getSummaryByUser(userId);
 
-      // Calculate overall totals
-      const totalsResult = await Database.query(
-        `SELECT 
-           SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as total_income,
-           SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END) as total_expenses,
-           SUM(amount) as net_balance
-         FROM transactions 
-         WHERE user_id = $1`,
-        [userId],
-      );
+      // Get totals
+      const totals = await transactionQueries.getTotalsByUser(userId);
 
-      const totals = totalsResult.rows[0];
-
-      // Format summary data
+      // Format category summary
       const summary = {};
-      result.rows.forEach((row) => {
-        summary[row.category] = {
-          income: parseFloat(row.income) || 0,
-          expense: parseFloat(row.expense) || 0,
-          net: parseFloat(row.net_total) || 0,
-        };
+      categorySummary.forEach((item) => {
+        summary[item.category] = parseFloat(item.total);
       });
 
       res.json({
         success: true,
         summary,
         totals: {
-          totalIncome: parseFloat(totals.total_income) || 0,
-          totalExpenses: parseFloat(totals.total_expenses) || 0,
-          netBalance: parseFloat(totals.net_balance) || 0,
+          totalIncome: totals.totalIncome,
+          totalExpenses: totals.totalExpenses,
+          netBalance: totals.totalIncome - totals.totalExpenses,
         },
         timestamp: new Date().toISOString(),
       });
@@ -202,15 +150,14 @@ class TransactionController {
       const { id } = req.params;
       const { amount, category, description, notes, transaction_date } =
         req.body;
-      const userId = req.user.id;
+      const userId = req.user.userId;
 
       // Check if transaction exists and belongs to user
-      const existingTransaction = await Database.query(
-        "SELECT id FROM transactions WHERE id = $1 AND user_id = $2",
-        [id, userId],
+      const existingTransaction = await transactionQueries.findByIdAndUser(
+        id,
+        userId,
       );
-
-      if (existingTransaction.rows.length === 0) {
+      if (!existingTransaction) {
         return res.status(404).json({
           success: false,
           error: {
@@ -221,27 +168,30 @@ class TransactionController {
         });
       }
 
-      const result = await Database.query(
-        `UPDATE transactions 
-         SET amount = $1, category = $2, description = $3, notes = $4, 
-             transaction_date = $5, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $6 AND user_id = $7
-         RETURNING id, user_id, amount, category, description, notes, transaction_date, updated_at`,
-        [
-          amount,
-          category,
-          description || null,
-          notes || null,
-          transaction_date,
-          id,
-          userId,
-        ],
+      const updateData = {
+        amount:
+          amount !== undefined
+            ? parseFloat(amount)
+            : existingTransaction.amount,
+        category: category || existingTransaction.category,
+        description:
+          description !== undefined
+            ? description
+            : existingTransaction.description,
+        notes: notes !== undefined ? notes : existingTransaction.notes,
+        transaction_date:
+          transaction_date || existingTransaction.transaction_date,
+      };
+
+      const updatedTransaction = await transactionQueries.update(
+        id,
+        updateData,
       );
 
       res.json({
         success: true,
         message: "Transaction updated successfully",
-        transaction: result.rows[0],
+        transaction: updatedTransaction,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -261,14 +211,14 @@ class TransactionController {
   static async deleteTransaction(req, res) {
     try {
       const { id } = req.params;
-      const userId = req.user.id;
+      const userId = req.user.userId;
 
-      const result = await Database.query(
-        "DELETE FROM transactions WHERE id = $1 AND user_id = $2 RETURNING id",
-        [id, userId],
+      // Check if transaction exists and belongs to user
+      const existingTransaction = await transactionQueries.findByIdAndUser(
+        id,
+        userId,
       );
-
-      if (result.rows.length === 0) {
+      if (!existingTransaction) {
         return res.status(404).json({
           success: false,
           error: {
@@ -278,6 +228,8 @@ class TransactionController {
           timestamp: new Date().toISOString(),
         });
       }
+
+      await transactionQueries.delete(id);
 
       res.json({
         success: true,

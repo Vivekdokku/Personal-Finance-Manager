@@ -1,7 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
-const Database = require("../models/database");
+const { User, Role } = require("../models/database");
 
 class AuthController {
   // User registration
@@ -24,12 +24,8 @@ class AuthController {
       const { email, password, role = "user" } = req.body;
 
       // Check if user already exists
-      const existingUser = await Database.query(
-        "SELECT id FROM users WHERE email = $1",
-        [email],
-      );
-
-      if (existingUser.rows.length > 0) {
+      const existingUser = await User.findByEmail(email);
+      if (existingUser) {
         return res.status(400).json({
           success: false,
           error: {
@@ -40,13 +36,9 @@ class AuthController {
         });
       }
 
-      // Get role ID
-      const roleResult = await Database.query(
-        "SELECT id FROM roles WHERE name = $1",
-        [role],
-      );
-
-      if (roleResult.rows.length === 0) {
+      // Get role data
+      const roleData = await Role.findByName(role);
+      if (!roleData) {
         return res.status(400).json({
           success: false,
           error: {
@@ -57,21 +49,19 @@ class AuthController {
         });
       }
 
-      const roleId = roleResult.rows[0].id;
-
       // Hash password
       const saltRounds = 12;
       const hashedPassword = await bcrypt.hash(password, saltRounds);
 
       // Create user
-      const userResult = await Database.query(
-        `INSERT INTO users (email, password, roleid, status) 
-         VALUES ($1, $2, $3, 'active') 
-         RETURNING id, email, status`,
-        [email, hashedPassword, roleId],
-      );
+      const userData = {
+        email,
+        password: hashedPassword,
+        roleid: roleData.id,
+        status: "active",
+      };
 
-      const newUser = userResult.rows[0];
+      const newUser = await User.create(userData);
 
       res.status(201).json({
         success: true,
@@ -90,7 +80,7 @@ class AuthController {
         success: false,
         error: {
           code: "REGISTRATION_ERROR",
-          message: "Failed to register user",
+          message: error.message || "Failed to register user",
         },
         timestamp: new Date().toISOString(),
       });
@@ -117,15 +107,8 @@ class AuthController {
       const { email, password } = req.body;
 
       // Find user with role information
-      const userResult = await Database.query(
-        `SELECT u.id, u.email, u.password, u.status, r.name as role 
-         FROM users u 
-         JOIN roles r ON u.roleid = r.id 
-         WHERE u.email = $1`,
-        [email],
-      );
-
-      if (userResult.rows.length === 0) {
+      const user = await User.findByEmail(email);
+      if (!user) {
         return res.status(401).json({
           success: false,
           error: {
@@ -135,8 +118,6 @@ class AuthController {
           timestamp: new Date().toISOString(),
         });
       }
-
-      const user = userResult.rows[0];
 
       // Check if user is active
       if (user.status !== "active") {
@@ -168,7 +149,7 @@ class AuthController {
         {
           userId: user.id,
           email: user.email,
-          role: user.role,
+          role: user.roleid,
         },
         process.env.JWT_SECRET,
         { expiresIn: process.env.JWT_EXPIRES_IN || "24h" },
@@ -181,6 +162,7 @@ class AuthController {
           id: user.id,
           email: user.email,
           role: user.role,
+          roleid: user.roleid,
           status: user.status,
         },
         timestamp: new Date().toISOString(),
@@ -191,7 +173,7 @@ class AuthController {
         success: false,
         error: {
           code: "LOGIN_ERROR",
-          message: "Failed to authenticate user",
+          message: error.message || "Failed to authenticate user",
         },
         timestamp: new Date().toISOString(),
       });
@@ -201,9 +183,27 @@ class AuthController {
   // Get current user info
   static async getCurrentUser(req, res) {
     try {
+      const user = await User.findById(req.user.userId);
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            code: "USER_NOT_FOUND",
+            message: "User not found",
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       res.json({
         success: true,
-        user: req.user,
+        user: {
+          id: user.id,
+          email: user.email,
+          role: user.role,
+          roleid: user.roleid,
+          status: user.status,
+        },
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -212,7 +212,7 @@ class AuthController {
         success: false,
         error: {
           code: "USER_INFO_ERROR",
-          message: "Failed to get user information",
+          message: error.message || "Failed to get user information",
         },
         timestamp: new Date().toISOString(),
       });
